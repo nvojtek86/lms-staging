@@ -152,8 +152,6 @@ const THUMBNAIL_MAX_BYTES = 10 * 1024 * 1024;
 const THUMBNAIL_MAX_WIDTH = 1400;
 const THUMBNAIL_MAX_HEIGHT = 860;
 const THUMBNAIL_WEBP_QUALITIES = [0.86, 0.78, 0.7];
-const THUMBNAIL_UPLOAD_TIMEOUT_MS = 30_000;
-const THUMBNAIL_UPLOAD_ATTEMPTS = 2;
 
 function fileNameToWebp(name: string): string {
   const base = name.trim().replace(/\.[^.]+$/, "") || "thumbnail";
@@ -2549,71 +2547,16 @@ export function CourseEditorV2Form({
     if (!thumbnailFile) return;
     const file = thumbnailFile;
 
-    async function signThumbnailUpload() {
-      const { data } = await fetchJson<{ bucket_id: string; object_name: string; token: string }>(
-        `/api/v2/courses/${courseIdToUse}/thumbnail/sign`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ mime: file.type, size_bytes: file.size }),
-        }
-      );
-      return data;
+    if (busyActionRef.current) {
+      setBusyStep("Uploading thumbnail");
     }
 
-    async function uploadSignedThumbnail(
-      sign: { bucket_id: string; object_name: string; token: string },
-      attempt: number
-    ) {
-      if (busyActionRef.current) {
-        setBusyStep(`Uploading thumbnail (${attempt}/${THUMBNAIL_UPLOAD_ATTEMPTS})`);
-      }
+    const form = new FormData();
+    form.append("file", file);
 
-      const uploadPromise = supabase.storage.from(sign.bucket_id).uploadToSignedUrl(sign.object_name, sign.token, file, {
-        contentType: file.type,
-      });
-      type UploadResult = Awaited<typeof uploadPromise>;
-
-      let timeoutId: ReturnType<typeof setTimeout> | null = null;
-      const timeoutPromise = new Promise<UploadResult>((_, reject) => {
-        timeoutId = setTimeout(() => {
-          reject(new Error("Thumbnail upload timed out. Retrying with a fresh upload link..."));
-        }, THUMBNAIL_UPLOAD_TIMEOUT_MS);
-      });
-
-      try {
-        const uploadRes = await Promise.race([uploadPromise, timeoutPromise]);
-        if (uploadRes.error) throw new Error(`Thumbnail upload failed: ${uploadRes.error.message}`);
-      } finally {
-        if (timeoutId) clearTimeout(timeoutId);
-      }
-    }
-
-    let sign = await signThumbnailUpload();
-    let lastError: unknown = null;
-    for (let attempt = 1; attempt <= THUMBNAIL_UPLOAD_ATTEMPTS; attempt++) {
-      try {
-        await uploadSignedThumbnail(sign, attempt);
-        lastError = null;
-        break;
-      } catch (e) {
-        lastError = e;
-        if (attempt >= THUMBNAIL_UPLOAD_ATTEMPTS) break;
-        if (busyActionRef.current) setBusyStep("Retrying thumbnail upload");
-        await new Promise((resolve) => setTimeout(resolve, 700));
-        sign = await signThumbnailUpload();
-      }
-    }
-
-    if (lastError) {
-      const message = lastError instanceof Error ? lastError.message : "Thumbnail upload failed.";
-      throw new Error(message.replace(" Retrying with a fresh upload link...", ""));
-    }
-
-    const { data } = await fetchJson<{ cover_image_url: string }>(`/api/v2/courses/${courseIdToUse}/thumbnail/commit`, {
+    const { data } = await fetchJson<{ cover_image_url: string }>(`/api/v2/courses/${courseIdToUse}/thumbnail`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ storage_path: sign.object_name, mime: file.type, size_bytes: file.size }),
+      body: form,
     });
 
     setThumbnailUrl(data.cover_image_url);
