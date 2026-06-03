@@ -365,6 +365,22 @@ function makeBlockId(): string {
   return makeTempId("blk");
 }
 
+function containsTemporaryAssetReference(value: unknown): boolean {
+  if (!value) return false;
+  if (typeof value === "string") {
+    return value.startsWith("blob:") || value.startsWith("data:image/");
+  }
+  if (Array.isArray(value)) return value.some(containsTemporaryAssetReference);
+  if (typeof value !== "object") return false;
+  const obj = value as Record<string, unknown>;
+  if (typeof obj.image_upload_id === "string" && obj.image_upload_id.trim().length > 0) return true;
+  return Object.values(obj).some(containsTemporaryAssetReference);
+}
+
+async function wait(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function fileFromImageDataUrl(dataUrl: string, fallbackName: string): Promise<File | null> {
   const match = /^data:(image\/(?:png|jpeg|webp|gif));base64,/i.exec(dataUrl);
   if (!match) return null;
@@ -374,6 +390,42 @@ async function fileFromImageDataUrl(dataUrl: string, fallbackName: string): Prom
   const blob = await res.blob();
   if (!blob.size) return null;
   return new File([blob], `${fallbackName}.${ext}`, { type: mime });
+}
+
+const SIGNED_UPLOAD_ATTEMPTS = 2;
+const LARGE_SIGNED_UPLOAD_TIMEOUT_MS = 10 * 60 * 1000;
+
+async function uploadFileToSignedUrlWithRetry(input: {
+  file: File;
+  contentType: string;
+  label: string;
+  signUpload: () => Promise<{ bucket_id: string; object_name: string; token: string }>;
+}): Promise<{ bucket_id: string; object_name: string }> {
+  let lastError: unknown = null;
+  for (let attempt = 1; attempt <= SIGNED_UPLOAD_ATTEMPTS; attempt++) {
+    const sign = await input.signUpload();
+    let timeoutId: ReturnType<typeof setTimeout> | null = null;
+    try {
+      const uploadPromise = supabase.storage.from(sign.bucket_id).uploadToSignedUrl(sign.object_name, sign.token, input.file, {
+        contentType: input.contentType,
+      });
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        timeoutId = setTimeout(() => {
+          reject(new Error(`${input.label} upload timed out.`));
+        }, LARGE_SIGNED_UPLOAD_TIMEOUT_MS);
+      });
+      const uploadRes = await Promise.race([uploadPromise, timeoutPromise]);
+      if (uploadRes.error) throw new Error(`${input.label} upload failed: ${uploadRes.error.message}`);
+      return { bucket_id: sign.bucket_id, object_name: sign.object_name };
+    } catch (e) {
+      lastError = e;
+      if (attempt >= SIGNED_UPLOAD_ATTEMPTS) break;
+      await wait(1000);
+    } finally {
+      if (timeoutId) clearTimeout(timeoutId);
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(`${input.label} upload failed.`);
 }
 
 function FieldHint({ children }: { children: React.ReactNode }) {
@@ -1323,6 +1375,7 @@ export function CourseEditorV2Form({
       uploadSig: uploadSig.sort((a, b) => a.k.localeCompare(b.k)),
       hasIntroVideoFile: Boolean(videoFile),
       hasThumbnailFile: Boolean(thumbnailFile),
+      pendingThumbnailRemoval,
     });
   }, [
     aboutHtml,
@@ -1338,6 +1391,7 @@ export function CourseEditorV2Form({
     pendingDeletedItemIds,
     pendingDeletedTopicIds,
     pendingLessonUploadsByItemId,
+    pendingThumbnailRemoval,
     requirements,
     selectedMemberIds,
     slug,
@@ -1400,6 +1454,7 @@ export function CourseEditorV2Form({
       uploadSig: [],
       hasIntroVideoFile: false,
       hasThumbnailFile: false,
+      pendingThumbnailRemoval: false,
     });
   }, [memberAccessById, memberDefaultAccess]);
 
@@ -1450,7 +1505,7 @@ export function CourseEditorV2Form({
 
   const hasUnsavedChanges = currentSignature !== savedSignatureRef.current || certSignature !== savedCertSignatureRef.current || certTplUploading;
 
-  // Autosave: every 5 minutes, persist the same pipeline as Save (silent).
+  // Autosave: every 5 minutes, persist text/settings only and leave file uploads for explicit Save/Publish.
   const autosaveCallbackRef = useRef<(() => void) | null>(null);
   const saveDraftRef = useRef(saveDraft);
   const savePublishedRef = useRef(savePublished);
@@ -1463,7 +1518,9 @@ export function CourseEditorV2Form({
       if (isBusy) return;
       // Avoid creating a draft course without a minimally valid title.
       if (!courseId && title.trim().length < 2) return;
-      void (status === "published" ? savePublishedRef.current({ silent: true }) : saveDraftRef.current({ silent: true }));
+      void (status === "published"
+        ? savePublishedRef.current({ silent: true, includeFileUploads: false })
+        : saveDraftRef.current({ silent: true, includeFileUploads: false }));
     };
   }, [courseId, hasUnsavedChanges, isBusy, status, title]);
 
@@ -1916,19 +1973,14 @@ export function CourseEditorV2Form({
       html: aboutHtml,
       queue: pruned,
       upload: async ({ uploadId, file }) => {
-        const { data: sign } = await fetchJson<{ bucket_id: string; object_name: string; token: string }>(
-          `/api/v2/courses/${courseIdToUse}/inline-images/sign`,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ mime: file.type, size_bytes: file.size, file_name: file.name }),
-          }
-        );
-        const uploadRes = await supabase.storage.from(sign.bucket_id).uploadToSignedUrl(sign.object_name, sign.token, file, {
-          contentType: file.type,
+        const form = new FormData();
+        form.append("file", file);
+        form.append("upload_id", uploadId);
+        const { data } = await fetchJson<{ storage_path: string; upload_id: string | null }>(`/api/v2/courses/${courseIdToUse}/inline-images`, {
+          method: "POST",
+          body: form,
         });
-        if (uploadRes.error) throw new Error(`Inline image upload failed: ${uploadRes.error.message}`);
-        return { storage_path: String(sign.object_name ?? ""), upload_id: uploadId };
+        return { storage_path: String(data.storage_path ?? ""), upload_id: data.upload_id ?? uploadId };
       },
       stableSrcForStoragePath: (storagePath) => `/api/v2/course-assets?path=${encodeURIComponent(storagePath)}`,
     });
@@ -2088,7 +2140,8 @@ export function CourseEditorV2Form({
     return id.startsWith("tmp_");
   }
 
-  async function syncCurriculumToServer(courseIdToUse: string): Promise<CourseTopic[]> {
+  async function syncCurriculumToServer(courseIdToUse: string, opts?: { includeFileUploads?: boolean }): Promise<CourseTopic[]> {
+    const includeFileUploads = opts?.includeFileUploads ?? true;
     function stableJsonStringify(value: unknown): string {
       const seen = new WeakSet<object>();
       const normalize = (v: unknown): unknown => {
@@ -2236,8 +2289,12 @@ export function CourseEditorV2Form({
           let nextPayload: Record<string, unknown> = { ...(item.payload_json ?? {}) };
           let shouldPatch = false;
 
+          if (!includeFileUploads && (pendingUploads || containsTemporaryAssetReference(nextPayload))) {
+            return null;
+          }
+
           // LESSON: upload assets + rewrite inline images, then patch payload_json.
-          if (item.item_type === "lesson" && pendingUploads) {
+          if (includeFileUploads && item.item_type === "lesson" && pendingUploads) {
             shouldPatch = true;
             const p = nextPayload as Record<string, unknown>;
             const basePayload: Record<string, unknown> = { ...p };
@@ -2249,19 +2306,13 @@ export function CourseEditorV2Form({
 
           if (pendingUploads.featureImageFile) {
             const file = pendingUploads.featureImageFile;
-            const { data: sign } = await fetchJson<{ bucket_id: string; object_name: string; token: string }>(
-              `/api/v2/items/${resolvedItemId}/lesson/feature-image/sign`,
-              {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ mime: file.type, size_bytes: file.size }),
-              }
-            );
-            const uploadRes = await supabase.storage.from(sign.bucket_id).uploadToSignedUrl(sign.object_name, sign.token, file, {
-              contentType: file.type,
+            const form = new FormData();
+            form.append("file", file);
+            const { data } = await fetchJson<{ storage_path: string }>(`/api/v2/items/${resolvedItemId}/lesson/feature-image`, {
+              method: "POST",
+              body: form,
             });
-            if (uploadRes.error) throw new Error(`Feature image upload failed: ${uploadRes.error.message}`);
-            featureImageStoragePath = sign.object_name;
+            featureImageStoragePath = String(data.storage_path ?? "");
           }
 
           let videoStoragePath: string | null =
@@ -2291,36 +2342,44 @@ export function CourseEditorV2Form({
           let uploadedAttachments = Array.isArray((p as { attachments?: unknown }).attachments) ? ((p as { attachments: unknown[] }).attachments as unknown[]) : [];
           if (pendingUploads.attachments?.length) {
             const files = pendingUploads.attachments;
-            const { data: signed } = await fetchJson<{
-              bucket_id: string;
-              uploads: Array<{ file_name: string; mime: string | null; size_bytes: number; object_name: string; token: string }>;
-            }>(`/api/v2/items/${resolvedItemId}/lesson/attachments/sign`, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                files: files.map((f) => ({ file_name: f.name, mime: f.type || null, size_bytes: f.size })),
-              }),
-            });
-
-            for (let i = 0; i < files.length; i++) {
-              const file = files[i];
-              const u = signed.uploads[i];
-              if (!u) throw new Error("Attachment signing mismatch.");
-              const up = await supabase.storage.from(signed.bucket_id).uploadToSignedUrl(u.object_name, u.token, file, {
+            const newAttachments: LessonModalState["existingAttachments"] = [];
+            for (const file of files) {
+              const uploaded = await uploadFileToSignedUrlWithRetry({
+                file,
                 contentType: file.type || "application/octet-stream",
+                label: file.name ? `Attachment "${file.name}"` : "Attachment",
+                signUpload: async () => {
+                  const { data } = await fetchJson<{
+                    bucket_id: string;
+                    uploads: Array<{ file_name: string; object_name: string; token: string; size_bytes: number; mime: string | null }>;
+                  }>(`/api/v2/items/${resolvedItemId}/lesson/attachments/sign`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                      files: [
+                        {
+                          file_name: file.name || "attachment",
+                          mime: file.type || "application/octet-stream",
+                          size_bytes: file.size,
+                        },
+                      ],
+                    }),
+                  });
+                  const signed = Array.isArray(data.uploads) ? data.uploads[0] : null;
+                  if (!data.bucket_id || !signed?.object_name || !signed.token) {
+                    throw new Error("Attachment upload could not be signed.");
+                  }
+                  return { bucket_id: data.bucket_id, object_name: signed.object_name, token: signed.token };
+                },
               });
-              if (up.error) throw new Error(`Attachment upload failed: ${up.error.message}`);
+              newAttachments.push({
+                file_name: file.name || "attachment",
+                storage_path: uploaded.object_name,
+                size_bytes: file.size,
+                mime: file.type || null,
+              });
             }
 
-            const newAttachments: LessonModalState["existingAttachments"] = signed.uploads.map((u, idx) => {
-              const f = files[idx];
-              return {
-                file_name: f?.name ?? u.file_name,
-                storage_path: u.object_name,
-                size_bytes: f?.size ?? u.size_bytes,
-                mime: (f?.type || u.mime || null) as string | null,
-              };
-            });
             uploadedAttachments = [...uploadedAttachments, ...newAttachments];
           }
 
@@ -2350,19 +2409,20 @@ export function CourseEditorV2Form({
                   html: blockHtml,
                   queue: blockQueue,
                   upload: async ({ uploadId, file }) => {
-                    const { data: sign } = await fetchJson<{ bucket_id: string; object_name: string; token: string }>(
-                      `/api/v2/items/${resolvedItemId}/lesson/inline-images/sign`,
+                    const form = new FormData();
+                    form.append("file", file);
+                    form.append("upload_id", uploadId);
+                    const { data } = await fetchJson<{ storage_path: string; upload_id: string | null }>(
+                      `/api/v2/items/${resolvedItemId}/lesson/inline-images`,
                       {
                         method: "POST",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({ mime: file.type, size_bytes: file.size, file_name: file.name }),
+                        body: form,
                       }
                     );
-                    const uploadRes = await supabase.storage.from(sign.bucket_id).uploadToSignedUrl(sign.object_name, sign.token, file, {
-                      contentType: file.type,
-                    });
-                    if (uploadRes.error) throw new Error(`Inline image upload failed: ${uploadRes.error.message}`);
-                    return { storage_path: String(sign.object_name ?? ""), upload_id: uploadId };
+                    return {
+                      storage_path: String(data.storage_path ?? ""),
+                      upload_id: data.upload_id ?? uploadId,
+                    };
                   },
                   stableSrcForStoragePath: (storagePath) => `/api/v2/lesson-assets?path=${encodeURIComponent(storagePath)}`,
                 });
@@ -2398,26 +2458,27 @@ export function CourseEditorV2Form({
           // QUIZ: upload queued images and migrate any legacy data-URL option images before patching payload_json.
           const hasQueuedQuizImages = Boolean(pendingUploads && Object.keys(pendingUploads.inlineImages ?? {}).length);
           const hasLegacyQuizDataUrls = item.item_type === "quiz" && JSON.stringify(nextPayload).includes("data:image/");
-          if (item.item_type === "quiz" && (hasQueuedQuizImages || hasLegacyQuizDataUrls)) {
+          if (includeFileUploads && item.item_type === "quiz" && (hasQueuedQuizImages || hasLegacyQuizDataUrls)) {
             shouldPatch = true;
             const base = nextPayload as Record<string, unknown>;
             const workingQueue: InlineImageQueue = { ...(pendingUploads?.inlineImages ?? {}) };
             const rawQuestions = Array.isArray((base as { questions?: unknown }).questions) ? ((base as { questions: unknown[] }).questions as unknown[]) : [];
             const stableSrcForStoragePath = (storagePath: string) => `/api/v2/lesson-assets?path=${encodeURIComponent(storagePath)}`;
             const uploadQuizImage = async ({ uploadId, file }: { uploadId: string; file: File }) => {
-              const { data: sign } = await fetchJson<{ bucket_id: string; object_name: string; token: string }>(
-                `/api/v2/items/${resolvedItemId}/lesson/inline-images/sign`,
+              const form = new FormData();
+              form.append("file", file);
+              form.append("upload_id", uploadId);
+              const { data } = await fetchJson<{ storage_path: string; upload_id: string | null }>(
+                `/api/v2/items/${resolvedItemId}/lesson/inline-images`,
                 {
                   method: "POST",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({ mime: file.type, size_bytes: file.size, file_name: file.name }),
+                  body: form,
                 }
               );
-              const uploadRes = await supabase.storage.from(sign.bucket_id).uploadToSignedUrl(sign.object_name, sign.token, file, {
-                contentType: file.type,
-              });
-              if (uploadRes.error) throw new Error(`Quiz image upload failed: ${uploadRes.error.message}`);
-              return { storage_path: String(sign.object_name ?? ""), upload_id: uploadId };
+              return {
+                storage_path: String(data.storage_path ?? ""),
+                upload_id: data.upload_id ?? uploadId,
+              };
             };
 
             const nextQuestions = [];
@@ -2743,7 +2804,8 @@ export function CourseEditorV2Form({
     setPendingThumbnailRemoval(true);
   }
 
-  async function savePublished(opts?: { afterSuccessNavigateTo?: string; showSuccessModal?: boolean; silent?: boolean }) {
+  async function savePublished(opts?: { afterSuccessNavigateTo?: string; showSuccessModal?: boolean; silent?: boolean; includeFileUploads?: boolean }) {
+    const includeFileUploads = opts?.includeFileUploads ?? true;
     setError(null);
     setIsBusy(true);
     if (!(opts?.silent ?? false)) {
@@ -2756,29 +2818,37 @@ export function CourseEditorV2Form({
     try {
       const id = await runStep("Preparing course", () => ensureCourseDraftExists());
       courseIdForContext = id;
-      const aboutFinal = await runStep("Saving About Course content", () => finalizeCourseAboutInlineImages(id));
+      const aboutFinal = includeFileUploads
+        ? await runStep("Saving About Course content", () => finalizeCourseAboutInlineImages(id))
+        : Object.keys(pruneQueueByHtml(pendingCourseAboutInlineImages ?? {}, aboutHtml)).length
+          ? savedSnapshotRef.current.aboutHtml
+          : aboutHtml;
       const saved = await runStep("Saving course details", () => saveCore(id, { aboutHtmlOverride: aboutFinal }));
       const membersSigBefore = getMembersSignature();
       if (membersSigBefore !== savedMembersSignatureRef.current) {
         await runStep("Saving members", () => saveMembers(id));
       }
-      await runStep("Uploading intro video", () => uploadIntroVideo(id));
-      if (pendingThumbnailRemoval || thumbnailFile) {
+      if (includeFileUploads) {
+        await runStep("Uploading intro video", () => uploadIntroVideo(id));
+      }
+      if (includeFileUploads && (pendingThumbnailRemoval || thumbnailFile)) {
         await runStep("Updating thumbnail", async () => {
           await removeThumbnailOnServer(id);
           await uploadThumbnail(id);
         });
       }
-      const syncedTopics = await runStep("Saving chapters and lessons", () => syncCurriculumToServer(id));
+      const syncedTopics = await runStep("Saving chapters and lessons", () => syncCurriculumToServer(id, { includeFileUploads }));
       setTopics(syncedTopics);
       setPendingDeletedItemIds([]);
       setPendingDeletedTopicIds([]);
-      for (const v of Object.values(pendingLessonUploadsByItemId ?? {})) {
-        revokeInlineQueueObjectUrls(v?.inlineImages ?? {});
+      if (includeFileUploads) {
+        for (const v of Object.values(pendingLessonUploadsByItemId ?? {})) {
+          revokeInlineQueueObjectUrls(v?.inlineImages ?? {});
+        }
+        revokeInlineQueueObjectUrls(pendingCourseAboutInlineImages ?? {});
+        setPendingLessonUploadsByItemId({});
+        setPendingCourseAboutInlineImages({});
       }
-      revokeInlineQueueObjectUrls(pendingCourseAboutInlineImages ?? {});
-      setPendingLessonUploadsByItemId({});
-      setPendingCourseAboutInlineImages({});
 
       await runStep("Finalizing save", () => fetchJson(`/api/v2/courses/${id}/save`, { method: "POST" }));
 
@@ -2847,6 +2917,7 @@ export function CourseEditorV2Form({
         uploadSig: [],
         hasIntroVideoFile: false,
         hasThumbnailFile: false,
+        pendingThumbnailRemoval: false,
       });
 
       const silent = opts?.silent ?? false;
@@ -2903,7 +2974,8 @@ export function CourseEditorV2Form({
     }
   }
 
-  async function saveDraft(opts?: { afterSuccessNavigateTo?: string; showSuccessModal?: boolean; silent?: boolean }) {
+  async function saveDraft(opts?: { afterSuccessNavigateTo?: string; showSuccessModal?: boolean; silent?: boolean; includeFileUploads?: boolean }) {
+    const includeFileUploads = opts?.includeFileUploads ?? true;
     setError(null);
     setIsBusy(true);
     if (!(opts?.silent ?? false)) {
@@ -2916,29 +2988,37 @@ export function CourseEditorV2Form({
     try {
       const id = await runStep("Preparing course", () => ensureCourseDraftExists());
       courseIdForContext = id;
-      const aboutFinal = await runStep("Saving About Course content", () => finalizeCourseAboutInlineImages(id));
+      const aboutFinal = includeFileUploads
+        ? await runStep("Saving About Course content", () => finalizeCourseAboutInlineImages(id))
+        : Object.keys(pruneQueueByHtml(pendingCourseAboutInlineImages ?? {}, aboutHtml)).length
+          ? savedSnapshotRef.current.aboutHtml
+          : aboutHtml;
       const saved = await runStep("Saving course details", () => saveCore(id, { aboutHtmlOverride: aboutFinal }));
       const membersSigBefore = getMembersSignature();
       if (membersSigBefore !== savedMembersSignatureRef.current) {
         await runStep("Saving members", () => saveMembers(id));
       }
-      await runStep("Uploading intro video", () => uploadIntroVideo(id));
-      if (pendingThumbnailRemoval || thumbnailFile) {
+      if (includeFileUploads) {
+        await runStep("Uploading intro video", () => uploadIntroVideo(id));
+      }
+      if (includeFileUploads && (pendingThumbnailRemoval || thumbnailFile)) {
         await runStep("Updating thumbnail", async () => {
           await removeThumbnailOnServer(id);
           await uploadThumbnail(id);
         });
       }
-      const syncedTopics = await runStep("Saving chapters and lessons", () => syncCurriculumToServer(id));
+      const syncedTopics = await runStep("Saving chapters and lessons", () => syncCurriculumToServer(id, { includeFileUploads }));
       setTopics(syncedTopics);
       setPendingDeletedItemIds([]);
       setPendingDeletedTopicIds([]);
-      for (const v of Object.values(pendingLessonUploadsByItemId ?? {})) {
-        revokeInlineQueueObjectUrls(v?.inlineImages ?? {});
+      if (includeFileUploads) {
+        for (const v of Object.values(pendingLessonUploadsByItemId ?? {})) {
+          revokeInlineQueueObjectUrls(v?.inlineImages ?? {});
+        }
+        revokeInlineQueueObjectUrls(pendingCourseAboutInlineImages ?? {});
+        setPendingLessonUploadsByItemId({});
+        setPendingCourseAboutInlineImages({});
       }
-      revokeInlineQueueObjectUrls(pendingCourseAboutInlineImages ?? {});
-      setPendingLessonUploadsByItemId({});
-      setPendingCourseAboutInlineImages({});
       await runStep("Finalizing save", () => fetchJson(`/api/v2/courses/${id}/save-draft`, { method: "POST" }));
       const finalSlug = saved.slug ?? slug;
       setSlug(finalSlug);
@@ -3005,6 +3085,7 @@ export function CourseEditorV2Form({
         uploadSig: [],
         hasIntroVideoFile: false,
         hasThumbnailFile: false,
+        pendingThumbnailRemoval: false,
       });
 
       const silent = opts?.silent ?? false;
@@ -3161,6 +3242,7 @@ export function CourseEditorV2Form({
         uploadSig: [],
         hasIntroVideoFile: false,
         hasThumbnailFile: false,
+        pendingThumbnailRemoval: false,
       });
 
       const navigateTo = opts?.afterSuccessNavigateTo ?? null;
