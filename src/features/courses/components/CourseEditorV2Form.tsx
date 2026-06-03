@@ -428,6 +428,33 @@ async function uploadFileToSignedUrlWithRetry(input: {
   throw lastError instanceof Error ? lastError : new Error(`${input.label} upload failed.`);
 }
 
+async function uploadSignedImageAsset(input: {
+  file: File;
+  label: string;
+  signEndpoint: string;
+  signPayload: Record<string, unknown>;
+  uploadId?: string | null;
+}): Promise<{ storage_path: string; upload_id: string | null }> {
+  const uploaded = await uploadFileToSignedUrlWithRetry({
+    file: input.file,
+    contentType: input.file.type || "application/octet-stream",
+    label: input.label,
+    signUpload: async () => {
+      const { data } = await fetchJson<{ bucket_id: string; object_name: string; token: string }>(input.signEndpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(input.signPayload),
+      });
+      if (!data.bucket_id || !data.object_name || !data.token) {
+        throw new Error(`${input.label} upload could not be signed.`);
+      }
+      return data;
+    },
+  });
+
+  return { storage_path: uploaded.object_name, upload_id: input.uploadId ?? null };
+}
+
 function FieldHint({ children }: { children: React.ReactNode }) {
   return <p className="mt-1.5 text-xs text-muted-foreground leading-relaxed">{children}</p>;
 }
@@ -1636,9 +1663,39 @@ export function CourseEditorV2Form({
   async function uploadCertificateTemplate(courseIdToUse: string, file: File) {
     setCertTplUploading(true);
     try {
-      const form = new FormData();
-      form.append("file", file);
-      await fetchJson<Record<string, unknown>>(`/api/courses/${courseIdToUse}/certificate-template`, { method: "POST", body: form });
+      const uploaded = await uploadFileToSignedUrlWithRetry({
+        file,
+        contentType: file.type || "application/octet-stream",
+        label: file.name ? `Certificate template "${file.name}"` : "Certificate template",
+        signUpload: async () => {
+          const { data } = await fetchJson<{ bucket_id: string; object_name: string; token: string }>(
+            `/api/courses/${courseIdToUse}/certificate-template/sign`,
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                file_name: file.name || "certificate-template",
+                mime: file.type,
+                size_bytes: file.size,
+              }),
+            }
+          );
+          if (!data.bucket_id || !data.object_name || !data.token) {
+            throw new Error("Certificate template upload could not be signed.");
+          }
+          return data;
+        },
+      });
+      await fetchJson<Record<string, unknown>>(`/api/courses/${courseIdToUse}/certificate-template/commit`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          storage_path: uploaded.object_name,
+          file_name: file.name || "certificate-template",
+          mime: file.type,
+          size_bytes: file.size,
+        }),
+      });
       setCertTplFile(null);
       setCertTplPreviewUrl(null);
       await loadCertificateSettingsAndTemplate(courseIdToUse);
@@ -1973,14 +2030,18 @@ export function CourseEditorV2Form({
       html: aboutHtml,
       queue: pruned,
       upload: async ({ uploadId, file }) => {
-        const form = new FormData();
-        form.append("file", file);
-        form.append("upload_id", uploadId);
-        const { data } = await fetchJson<{ storage_path: string; upload_id: string | null }>(`/api/v2/courses/${courseIdToUse}/inline-images`, {
-          method: "POST",
-          body: form,
+        const uploaded = await uploadSignedImageAsset({
+          file,
+          label: file.name ? `Course image "${file.name}"` : "Course image",
+          signEndpoint: `/api/v2/courses/${courseIdToUse}/inline-images/sign`,
+          signPayload: {
+            file_name: file.name || "inline-image",
+            mime: file.type,
+            size_bytes: file.size,
+          },
+          uploadId,
         });
-        return { storage_path: String(data.storage_path ?? ""), upload_id: data.upload_id ?? uploadId };
+        return { storage_path: uploaded.storage_path, upload_id: uploaded.upload_id ?? uploadId };
       },
       stableSrcForStoragePath: (storagePath) => `/api/v2/course-assets?path=${encodeURIComponent(storagePath)}`,
     });
@@ -2306,13 +2367,16 @@ export function CourseEditorV2Form({
 
           if (pendingUploads.featureImageFile) {
             const file = pendingUploads.featureImageFile;
-            const form = new FormData();
-            form.append("file", file);
-            const { data } = await fetchJson<{ storage_path: string }>(`/api/v2/items/${resolvedItemId}/lesson/feature-image`, {
-              method: "POST",
-              body: form,
+            const uploaded = await uploadSignedImageAsset({
+              file,
+              label: file.name ? `Lesson feature image "${file.name}"` : "Lesson feature image",
+              signEndpoint: `/api/v2/items/${resolvedItemId}/lesson/feature-image/sign`,
+              signPayload: {
+                mime: file.type,
+                size_bytes: file.size,
+              },
             });
-            featureImageStoragePath = String(data.storage_path ?? "");
+            featureImageStoragePath = uploaded.storage_path;
           }
 
           let videoStoragePath: string | null =
@@ -2409,19 +2473,20 @@ export function CourseEditorV2Form({
                   html: blockHtml,
                   queue: blockQueue,
                   upload: async ({ uploadId, file }) => {
-                    const form = new FormData();
-                    form.append("file", file);
-                    form.append("upload_id", uploadId);
-                    const { data } = await fetchJson<{ storage_path: string; upload_id: string | null }>(
-                      `/api/v2/items/${resolvedItemId}/lesson/inline-images`,
-                      {
-                        method: "POST",
-                        body: form,
-                      }
-                    );
+                    const uploaded = await uploadSignedImageAsset({
+                      file,
+                      label: file.name ? `Lesson inline image "${file.name}"` : "Lesson inline image",
+                      signEndpoint: `/api/v2/items/${resolvedItemId}/lesson/inline-images/sign`,
+                      signPayload: {
+                        file_name: file.name || "inline-image",
+                        mime: file.type,
+                        size_bytes: file.size,
+                      },
+                      uploadId,
+                    });
                     return {
-                      storage_path: String(data.storage_path ?? ""),
-                      upload_id: data.upload_id ?? uploadId,
+                      storage_path: uploaded.storage_path,
+                      upload_id: uploaded.upload_id ?? uploadId,
                     };
                   },
                   stableSrcForStoragePath: (storagePath) => `/api/v2/lesson-assets?path=${encodeURIComponent(storagePath)}`,
@@ -2465,19 +2530,20 @@ export function CourseEditorV2Form({
             const rawQuestions = Array.isArray((base as { questions?: unknown }).questions) ? ((base as { questions: unknown[] }).questions as unknown[]) : [];
             const stableSrcForStoragePath = (storagePath: string) => `/api/v2/lesson-assets?path=${encodeURIComponent(storagePath)}`;
             const uploadQuizImage = async ({ uploadId, file }: { uploadId: string; file: File }) => {
-              const form = new FormData();
-              form.append("file", file);
-              form.append("upload_id", uploadId);
-              const { data } = await fetchJson<{ storage_path: string; upload_id: string | null }>(
-                `/api/v2/items/${resolvedItemId}/lesson/inline-images`,
-                {
-                  method: "POST",
-                  body: form,
-                }
-              );
+              const uploaded = await uploadSignedImageAsset({
+                file,
+                label: file.name ? `Quiz image "${file.name}"` : "Quiz image",
+                signEndpoint: `/api/v2/items/${resolvedItemId}/lesson/inline-images/sign`,
+                signPayload: {
+                  file_name: file.name || "inline-image",
+                  mime: file.type,
+                  size_bytes: file.size,
+                },
+                uploadId,
+              });
               return {
-                storage_path: String(data.storage_path ?? ""),
-                upload_id: data.upload_id ?? uploadId,
+                storage_path: uploaded.storage_path,
+                upload_id: uploaded.upload_id ?? uploadId,
               };
             };
 
@@ -2644,12 +2710,30 @@ export function CourseEditorV2Form({
       setBusyStep("Uploading thumbnail");
     }
 
-    const form = new FormData();
-    form.append("file", file);
+    const uploaded = await uploadFileToSignedUrlWithRetry({
+      file,
+      contentType: file.type || "image/webp",
+      label: "Thumbnail",
+      signUpload: async () => {
+        const { data } = await fetchJson<{ bucket_id: string; object_name: string; token: string }>(
+          `/api/v2/courses/${courseIdToUse}/thumbnail/sign`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ mime: file.type, size_bytes: file.size }),
+          }
+        );
+        if (!data.bucket_id || !data.object_name || !data.token) {
+          throw new Error("Thumbnail upload could not be signed.");
+        }
+        return data;
+      },
+    });
 
-    const { data } = await fetchJson<{ cover_image_url: string }>(`/api/v2/courses/${courseIdToUse}/thumbnail`, {
+    const { data } = await fetchJson<{ cover_image_url: string }>(`/api/v2/courses/${courseIdToUse}/thumbnail/commit`, {
       method: "POST",
-      body: form,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ storage_path: uploaded.object_name, mime: file.type, size_bytes: file.size }),
     });
 
     setThumbnailUrl(data.cover_image_url);
