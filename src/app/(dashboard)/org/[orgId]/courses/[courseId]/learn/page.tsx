@@ -23,6 +23,34 @@ function isUuidLike(input: string): boolean {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(input);
 }
 
+function isSafeStoragePath(input: string): boolean {
+  if (!input.trim()) return false;
+  if (input.length > 600) return false;
+  if (input.includes("..")) return false;
+  if (input.startsWith("/")) return false;
+  return true;
+}
+
+function normalizeQuizOptionImageUrl(input: unknown): string | null {
+  if (typeof input !== "string") return null;
+  const value = input.trim();
+  if (!value) return null;
+  if (value.startsWith("data:image/")) return value;
+
+  try {
+    const parsed = new URL(value, "http://local.invalid");
+    if (parsed.origin !== "http://local.invalid") return null;
+    if (parsed.pathname !== "/api/v2/lesson-assets") return null;
+
+    const storagePath = parsed.searchParams.get("path");
+    if (!storagePath || !isSafeStoragePath(storagePath)) return null;
+
+    return `/api/v2/lesson-assets?path=${encodeURIComponent(storagePath)}`;
+  } catch {
+    return null;
+  }
+}
+
 export default async function CourseLearnPage({
   params,
 }: {
@@ -268,9 +296,7 @@ export default async function CourseLearnPage({
                   const optId = typeof oo.id === "string" ? oo.id : "";
                   if (!optId) return null;
                   const optTitle = typeof oo.title === "string" ? oo.title : "";
-                  const image_data_url = typeof oo.image_data_url === "string" && oo.image_data_url.startsWith("data:image/")
-                    ? oo.image_data_url
-                    : null;
+                  const image_data_url = normalizeQuizOptionImageUrl(oo.image_data_url);
                   const display_format =
                     oo.display_format === "only_image" || oo.display_format === "text_and_image_both" ? String(oo.display_format) : "only_text";
                   const position = Number.isFinite(Number(oo.position)) ? Number(oo.position) : idx;
