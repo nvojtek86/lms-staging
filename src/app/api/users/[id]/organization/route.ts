@@ -4,6 +4,25 @@ import { assignOrganizationSchema, validateSchema } from "@/lib/validations/sche
 import { apiError, apiOk } from "@/lib/api/response";
 import { logApiEvent } from "@/lib/audit/apiEvents";
 
+async function upsertOrganizationMembership(input: {
+  admin: ReturnType<typeof createAdminSupabaseClient>;
+  userId: string;
+  organizationId: string;
+  role: "organization_admin" | "member";
+}) {
+  return input.admin
+    .from("organization_memberships")
+    .upsert(
+      {
+        user_id: input.userId,
+        organization_id: input.organizationId,
+        role: input.role,
+        is_active: true,
+      },
+      { onConflict: "user_id,organization_id" }
+    );
+}
+
 /**
  * PATCH /api/users/[id]/organization
  * Assign/reassign an org-scoped user (organization_admin or member) to an organization.
@@ -270,30 +289,16 @@ export async function PATCH(
       }
     }
 
-    // Keep organization_memberships in sync for org-admin org assignment (best-effort).
-    // For org-admins, access to /org/[orgId] is enforced through organization_memberships, not users.organization_id.
+    // Keep organization_memberships in sync for org-scoped users (best-effort).
+    // Access to /org/[orgId] is enforced through organization_memberships in the org layout.
     try {
       if (targetRole === "organization_admin") {
-        const { data: existing } = await admin
-          .from("organization_memberships")
-          .select("user_id")
-          .eq("user_id", userId)
-          .eq("organization_id", organization_id);
-
-        if (Array.isArray(existing) && existing.length > 0) {
-          await admin
-            .from("organization_memberships")
-            .update({ role: "organization_admin", is_active: true })
-            .eq("user_id", userId)
-            .eq("organization_id", organization_id);
-        } else {
-          await admin.from("organization_memberships").insert({
-            user_id: userId,
-            organization_id,
-            role: "organization_admin",
-            is_active: true,
-          });
-        }
+        await upsertOrganizationMembership({
+          admin,
+          userId,
+          organizationId: organization_id,
+          role: "organization_admin",
+        });
 
         // Enforce single-organization org-admin: deactivate any other org-admin memberships.
         await admin
@@ -302,6 +307,15 @@ export async function PATCH(
           .eq("user_id", userId)
           .eq("role", "organization_admin")
           .neq("organization_id", organization_id);
+      }
+
+      if (targetRole === "member") {
+        await upsertOrganizationMembership({
+          admin,
+          userId,
+          organizationId: organization_id,
+          role: "member",
+        });
       }
     } catch {
       // ignore

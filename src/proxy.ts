@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import type { NextRequest } from 'next/server';
 import { createServerClient } from '@supabase/ssr';
+import type { SupabaseClient } from '@supabase/supabase-js';
 
 // Define valid user roles
 type UserRole = 'super_admin' | 'system_admin' | 'organization_admin' | 'member';
@@ -22,6 +23,42 @@ const ROUTE_ACCESS: Record<string, UserRole[]> = {
 // and env.mjs validation happens at build time for these public variables.
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL!;
 const SUPABASE_ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
+
+async function getOrgRedirectTarget(
+  supabase: SupabaseClient,
+  userId: string,
+  role: UserRole,
+  primaryOrganizationId: string | null
+): Promise<{ organizationId: string; slug: string | null } | null> {
+  let organizationId = primaryOrganizationId;
+
+  if (!organizationId && (role === 'organization_admin' || role === 'member')) {
+    const { data: membership } = await supabase
+      .from('organization_memberships')
+      .select('organization_id')
+      .eq('user_id', userId)
+      .eq('role', role)
+      .eq('is_active', true)
+      .order('created_at', { ascending: true })
+      .limit(1)
+      .maybeSingle();
+
+    const membershipOrgId = (membership as { organization_id?: unknown } | null)?.organization_id;
+    organizationId = typeof membershipOrgId === 'string' && membershipOrgId.trim().length > 0 ? membershipOrgId : null;
+  }
+
+  if (!organizationId) return null;
+
+  const { data: orgRow } = await supabase
+    .from('organizations')
+    .select('slug')
+    .eq('id', organizationId)
+    .maybeSingle();
+  const slugRaw = (orgRow as { slug?: unknown } | null)?.slug;
+  const slug = typeof slugRaw === 'string' && slugRaw.trim().length > 0 ? slugRaw.trim() : null;
+
+  return { organizationId, slug };
+}
 
 export async function proxy(request: NextRequest) {
   const path = request.nextUrl.pathname;
@@ -141,18 +178,12 @@ export async function proxy(request: NextRequest) {
     const url = new URL(request.url);
 
     if (userRole === 'organization_admin' || userRole === 'member') {
-      if (!organizationId) {
+      const orgTarget = await getOrgRedirectTarget(supabase, user.id, userRole, organizationId);
+      if (!orgTarget) {
         url.pathname = '/';
         return NextResponse.redirect(url);
       }
-      const { data: orgRow } = await supabase
-        .from('organizations')
-        .select('slug')
-        .eq('id', organizationId)
-        .maybeSingle();
-      const slugRaw = (orgRow as { slug?: unknown } | null)?.slug;
-      const slug = typeof slugRaw === 'string' && slugRaw.trim().length > 0 ? slugRaw.trim() : null;
-      url.pathname = `/org/${slug ?? organizationId}`;
+      url.pathname = `/org/${orgTarget.slug ?? orgTarget.organizationId}`;
       return NextResponse.redirect(url);
     }
 
@@ -172,18 +203,12 @@ export async function proxy(request: NextRequest) {
       return NextResponse.redirect(url);
     }
     if (userRole === 'organization_admin' || userRole === 'member') {
-      if (!organizationId) {
+      const orgTarget = await getOrgRedirectTarget(supabase, user.id, userRole, organizationId);
+      if (!orgTarget) {
         url.pathname = '/';
         return NextResponse.redirect(url);
       }
-      const { data: orgRow } = await supabase
-        .from('organizations')
-        .select('slug')
-        .eq('id', organizationId)
-        .maybeSingle();
-      const slugRaw = (orgRow as { slug?: unknown } | null)?.slug;
-      const slug = typeof slugRaw === 'string' && slugRaw.trim().length > 0 ? slugRaw.trim() : null;
-      url.pathname = `/org/${slug ?? organizationId}`;
+      url.pathname = `/org/${orgTarget.slug ?? orgTarget.organizationId}`;
       return NextResponse.redirect(url);
     }
   }

@@ -5,6 +5,25 @@ import { env } from '@/env.mjs';
 import { apiError, apiOk } from "@/lib/api/response";
 import { logApiEvent } from "@/lib/audit/apiEvents";
 
+async function upsertOrganizationMembership(input: {
+  adminClient: ReturnType<typeof createAdminSupabaseClient>;
+  userId: string;
+  organizationId: string;
+  role: "organization_admin" | "member";
+}) {
+  return input.adminClient
+    .from("organization_memberships")
+    .upsert(
+      {
+        user_id: input.userId,
+        organization_id: input.organizationId,
+        role: input.role,
+        is_active: true,
+      },
+      { onConflict: "user_id,organization_id" }
+    );
+}
+
 /**
  * POST /api/users/invite
  * Invites a new user via Supabase Auth Admin API + creates profile row
@@ -335,15 +354,13 @@ export async function POST(request: NextRequest) {
       return apiError("INTERNAL", "Failed to create user profile.", { status: 500 });
     }
 
-    if (role === "member" && finalOrgId) {
-      const { error: membershipInsertError } = await adminClient
-        .from("organization_memberships")
-        .insert({
-          user_id: authData.user.id,
-          organization_id: finalOrgId,
-          role: "member",
-          is_active: true,
-        });
+    if ((role === "member" || role === "organization_admin") && finalOrgId) {
+      const { error: membershipInsertError } = await upsertOrganizationMembership({
+        adminClient,
+        userId: authData.user.id,
+        organizationId: finalOrgId,
+        role,
+      });
 
       if (membershipInsertError) {
         await adminClient.from("users").delete().eq("id", authData.user.id);
