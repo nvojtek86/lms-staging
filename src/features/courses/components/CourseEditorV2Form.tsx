@@ -36,6 +36,7 @@ import { ApiClientError, fetchJson } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { normalizeSlug } from "@/lib/courses/v2.shared";
 import { supabase } from "@/lib/supabase/client";
+import * as tus from "tus-js-client";
 import { generateSupportId } from "@/lib/support/supportId";
 import {
   ACCESS_DURATION_KEYS,
@@ -393,29 +394,48 @@ async function fileFromImageDataUrl(dataUrl: string, fallbackName: string): Prom
 }
 
 const SIGNED_UPLOAD_ATTEMPTS = 2;
-const LARGE_SIGNED_UPLOAD_TIMEOUT_MS = 10 * 60 * 1000;
+// Direct (non-resumable) signed uploads are only used for small files (<= 6MB),
+// so a tight per-attempt timeout keeps the UI responsive instead of "frozen".
+const SMALL_SIGNED_UPLOAD_TIMEOUT_MS = 90 * 1000;
+// Files larger than this use TUS resumable uploads (chunked + auto-retry) instead.
+const RESUMABLE_UPLOAD_THRESHOLD_BYTES = 6 * 1024 * 1024;
+const TUS_CHUNK_SIZE_BYTES = 6 * 1024 * 1024;
+// Backstop step ceilings (the real protection is per-request / per-upload timeouts).
+const STEP_TIMEOUT_DEFAULT_MS = 60 * 1000;
+const STEP_TIMEOUT_UPLOAD_MS = 30 * 60 * 1000;
 
-async function uploadFileToSignedUrlWithRetry(input: {
+const SUPABASE_PROJECT_URL = process.env.NEXT_PUBLIC_SUPABASE_URL ?? "";
+
+type UploadProgress = { label: string; loaded: number; total: number; pct: number };
+type UploadProgressFn = (progress: UploadProgress) => void;
+
+type SignedUpload = { bucket_id: string; object_name: string; token: string };
+
+// Small files (<= 6MB): one-shot direct upload to a signed URL with a tight timeout + a couple retries.
+async function uploadSmallSignedFile(input: {
   file: File;
   contentType: string;
   label: string;
-  signUpload: () => Promise<{ bucket_id: string; object_name: string; token: string }>;
+  signUpload: () => Promise<SignedUpload>;
+  onProgress?: UploadProgressFn;
 }): Promise<{ bucket_id: string; object_name: string }> {
   let lastError: unknown = null;
   for (let attempt = 1; attempt <= SIGNED_UPLOAD_ATTEMPTS; attempt++) {
     const sign = await input.signUpload();
     let timeoutId: ReturnType<typeof setTimeout> | null = null;
     try {
+      input.onProgress?.({ label: input.label, loaded: 0, total: input.file.size, pct: 0 });
       const uploadPromise = supabase.storage.from(sign.bucket_id).uploadToSignedUrl(sign.object_name, sign.token, input.file, {
         contentType: input.contentType,
       });
       const timeoutPromise = new Promise<never>((_, reject) => {
         timeoutId = setTimeout(() => {
           reject(new Error(`${input.label} upload timed out.`));
-        }, LARGE_SIGNED_UPLOAD_TIMEOUT_MS);
+        }, SMALL_SIGNED_UPLOAD_TIMEOUT_MS);
       });
       const uploadRes = await Promise.race([uploadPromise, timeoutPromise]);
       if (uploadRes.error) throw new Error(`${input.label} upload failed: ${uploadRes.error.message}`);
+      input.onProgress?.({ label: input.label, loaded: input.file.size, total: input.file.size, pct: 100 });
       return { bucket_id: sign.bucket_id, object_name: sign.object_name };
     } catch (e) {
       lastError = e;
@@ -428,17 +448,87 @@ async function uploadFileToSignedUrlWithRetry(input: {
   throw lastError instanceof Error ? lastError : new Error(`${input.label} upload failed.`);
 }
 
+// Large files (> 6MB): resumable TUS upload (chunked, auto-retry, resumable across reloads).
+// Uses Supabase presigned resumable endpoint with the signed token in the `x-signature` header.
+async function uploadResumableSignedFile(input: {
+  file: File;
+  contentType: string;
+  label: string;
+  signUpload: () => Promise<SignedUpload>;
+  onProgress?: UploadProgressFn;
+}): Promise<{ bucket_id: string; object_name: string }> {
+  if (!SUPABASE_PROJECT_URL) {
+    throw new Error(`${input.label} upload is not configured (missing storage URL).`);
+  }
+  const sign = await input.signUpload();
+  const endpoint = `${SUPABASE_PROJECT_URL}/storage/v1/upload/resumable/sign`;
+
+  return await new Promise<{ bucket_id: string; object_name: string }>((resolve, reject) => {
+    const upload = new tus.Upload(input.file, {
+      endpoint,
+      retryDelays: [0, 3000, 5000, 10000, 20000],
+      headers: { "x-signature": sign.token },
+      uploadDataDuringCreation: true,
+      removeFingerprintOnSuccess: true,
+      chunkSize: TUS_CHUNK_SIZE_BYTES,
+      metadata: {
+        bucketName: sign.bucket_id,
+        objectName: sign.object_name,
+        contentType: input.contentType,
+        cacheControl: "3600",
+      },
+      onError: (error) => {
+        reject(new Error(`${input.label} upload failed: ${error instanceof Error ? error.message : String(error)}`));
+      },
+      onProgress: (loaded, total) => {
+        input.onProgress?.({ label: input.label, loaded, total, pct: total > 0 ? Math.round((loaded / total) * 100) : 0 });
+      },
+      onSuccess: () => {
+        input.onProgress?.({ label: input.label, loaded: input.file.size, total: input.file.size, pct: 100 });
+        resolve({ bucket_id: sign.bucket_id, object_name: sign.object_name });
+      },
+    });
+
+    upload
+      .findPreviousUploads()
+      .then((previous) => {
+        if (previous.length > 0) upload.resumeFromPreviousUpload(previous[0]);
+        upload.start();
+      })
+      .catch(() => {
+        // If resume lookup fails, just start fresh.
+        upload.start();
+      });
+  });
+}
+
+// Size-aware upload: direct signed upload for small files, resumable TUS for large files.
+async function uploadFileToSignedUrlWithRetry(input: {
+  file: File;
+  contentType: string;
+  label: string;
+  signUpload: () => Promise<SignedUpload>;
+  onProgress?: UploadProgressFn;
+}): Promise<{ bucket_id: string; object_name: string }> {
+  if (input.file.size > RESUMABLE_UPLOAD_THRESHOLD_BYTES) {
+    return uploadResumableSignedFile(input);
+  }
+  return uploadSmallSignedFile(input);
+}
+
 async function uploadSignedImageAsset(input: {
   file: File;
   label: string;
   signEndpoint: string;
   signPayload: Record<string, unknown>;
   uploadId?: string | null;
+  onProgress?: UploadProgressFn;
 }): Promise<{ storage_path: string; upload_id: string | null }> {
   const uploaded = await uploadFileToSignedUrlWithRetry({
     file: input.file,
     contentType: input.file.type || "application/octet-stream",
     label: input.label,
+    onProgress: input.onProgress,
     signUpload: async () => {
       const { data } = await fetchJson<{ bucket_id: string; object_name: string; token: string }>(input.signEndpoint, {
         method: "POST",
@@ -453,6 +543,83 @@ async function uploadSignedImageAsset(input: {
   });
 
   return { storage_path: uploaded.object_name, upload_id: input.uploadId ?? null };
+}
+
+// Largest JSON body we will PATCH for a single item. Stays well under Vercel's 4.5MB limit.
+const MAX_ITEM_PAYLOAD_BYTES = 3 * 1024 * 1024;
+
+function assertItemPayloadSafe(payload: unknown, itemLabel: string): void {
+  const serialized = JSON.stringify(payload ?? {});
+  if (serialized.includes("data:image/") || serialized.includes("blob:")) {
+    throw new Error(
+      `${itemLabel}: an image could not be uploaded, so it can't be saved yet. Please re-insert the image and save again.`
+    );
+  }
+  if (serialized.length > MAX_ITEM_PAYLOAD_BYTES) {
+    throw new Error(
+      `${itemLabel}: this content is too large to save in one request. Please split it into multiple lessons or remove some embedded media.`
+    );
+  }
+}
+
+type StrayImageContext = { signEndpoint: string; label: string; onProgress?: UploadProgressFn };
+
+async function uploadStrayDataImage(dataUrl: string, ctx: StrayImageContext): Promise<string | null> {
+  const file = await fileFromImageDataUrl(dataUrl, `image-${Date.now()}`);
+  if (!file) return null;
+  const uploaded = await uploadSignedImageAsset({
+    file,
+    label: ctx.label,
+    signEndpoint: ctx.signEndpoint,
+    signPayload: { file_name: file.name, mime: file.type, size_bytes: file.size },
+    onProgress: ctx.onProgress,
+  });
+  return `/api/v2/lesson-assets?path=${encodeURIComponent(uploaded.storage_path)}`;
+}
+
+// Walk an arbitrary item payload, upload any leftover base64 images, and rewrite references
+// to stable storage URLs. Covers untracked data URLs in HTML (img src) and bare data-URL fields.
+async function deepFinalizeStrayDataImages(value: unknown, ctx: StrayImageContext): Promise<unknown> {
+  if (typeof value === "string") {
+    if (!value.includes("data:image/")) return value;
+
+    if (value.startsWith("data:image/")) {
+      const stable = await uploadStrayDataImage(value, ctx);
+      return stable ?? value;
+    }
+
+    // HTML string containing one or more inline data-image <img> tags.
+    if (typeof DOMParser === "undefined") return value;
+    const doc = new DOMParser().parseFromString(value, "text/html");
+    const imgs = Array.from(doc.querySelectorAll("img"));
+    let changed = false;
+    for (const img of imgs) {
+      const src = img.getAttribute("src") ?? "";
+      if (!src.startsWith("data:image/")) continue;
+      const stable = await uploadStrayDataImage(src, ctx);
+      if (!stable) continue;
+      img.setAttribute("src", stable);
+      img.removeAttribute("data-inline-upload-id");
+      changed = true;
+    }
+    return changed ? doc.body.innerHTML : value;
+  }
+
+  if (Array.isArray(value)) {
+    const out: unknown[] = [];
+    for (const v of value) out.push(await deepFinalizeStrayDataImages(v, ctx));
+    return out;
+  }
+
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      out[k] = await deepFinalizeStrayDataImages(v, ctx);
+    }
+    return out;
+  }
+
+  return value;
 }
 
 function FieldHint({ children }: { children: React.ReactNode }) {
@@ -1237,6 +1404,10 @@ export function CourseEditorV2Form({
   const busyActionRef = useRef<BusyAction | null>(null);
   const [busyStep, setBusyStep] = useState<string | null>(null);
   const [busyVisitedSteps, setBusyVisitedSteps] = useState<string[]>([]);
+  const [uploadProgress, setUploadProgress] = useState<UploadProgress | null>(null);
+  const reportUploadProgress = useCallback<UploadProgressFn>((progress) => {
+    setUploadProgress(progress.pct >= 100 ? null : progress);
+  }, []);
   const [error, setError] = useState<string | null>(null);
   const [errorStep, setErrorStep] = useState<string | null>(null);
   const [errorSupportId, setErrorSupportId] = useState<string | null>(null);
@@ -2388,19 +2559,27 @@ export function CourseEditorV2Form({
           const provider = video?.provider === "youtube" || video?.provider === "vimeo" ? (video.provider as string) : "html5";
           if (provider === "html5" && pendingUploads.videoFile) {
             const file = pendingUploads.videoFile;
-            const { data: sign } = await fetchJson<{ bucket_id: string; object_name: string; token: string }>(
-              `/api/v2/items/${resolvedItemId}/lesson/video/sign`,
-              {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ mime: "video/mp4", size_bytes: file.size }),
-              }
-            );
-            const uploadRes = await supabase.storage.from(sign.bucket_id).uploadToSignedUrl(sign.object_name, sign.token, file, {
-              contentType: file.type,
+            const uploaded = await uploadFileToSignedUrlWithRetry({
+              file,
+              contentType: file.type || "video/mp4",
+              label: file.name ? `Lesson video "${file.name}"` : "Lesson video",
+              onProgress: reportUploadProgress,
+              signUpload: async () => {
+                const { data } = await fetchJson<{ bucket_id: string; object_name: string; token: string }>(
+                  `/api/v2/items/${resolvedItemId}/lesson/video/sign`,
+                  {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ mime: "video/mp4", size_bytes: file.size }),
+                  }
+                );
+                if (!data.bucket_id || !data.object_name || !data.token) {
+                  throw new Error("Lesson video upload could not be signed.");
+                }
+                return data;
+              },
             });
-            if (uploadRes.error) throw new Error(`Lesson video upload failed: ${uploadRes.error.message}`);
-            videoStoragePath = sign.object_name;
+            videoStoragePath = uploaded.object_name;
           }
 
           let uploadedAttachments = Array.isArray((p as { attachments?: unknown }).attachments) ? ((p as { attachments: unknown[] }).attachments as unknown[]) : [];
@@ -2412,6 +2591,7 @@ export function CourseEditorV2Form({
                 file,
                 contentType: file.type || "application/octet-stream",
                 label: file.name ? `Attachment "${file.name}"` : "Attachment",
+                onProgress: reportUploadProgress,
                 signUpload: async () => {
                   const { data } = await fetchJson<{
                     bucket_id: string;
@@ -2614,6 +2794,20 @@ export function CourseEditorV2Form({
             nextPayload = { ...base, questions: nextQuestions };
           }
 
+          // Safety net: convert any stray base64 (data:image/...) that wasn't tracked by the
+          // inline-image queue into a real Supabase upload, so we never PATCH a giant JSON body.
+          if (includeFileUploads && JSON.stringify(nextPayload).includes("data:image/")) {
+            shouldPatch = true;
+            nextPayload = (await deepFinalizeStrayDataImages(nextPayload, {
+              signEndpoint: `/api/v2/items/${resolvedItemId}/lesson/inline-images/sign`,
+              label: item.title ? `"${item.title}" image` : "Image",
+              onProgress: reportUploadProgress,
+            })) as Record<string, unknown>;
+          }
+
+          // Final guard: never send a payload that would break the request (base64 leftovers / oversized JSON).
+          assertItemPayloadSafe(nextPayload, item.title ?? (item.item_type === "quiz" ? "Quiz" : "Lesson"));
+
           const prevSig = savedPayloadSigById.get(resolvedItemId) ?? null;
           const nextSig = stableJsonStringify(nextPayload);
           if (!shouldPatch && prevSig !== nextSig) shouldPatch = true;
@@ -2655,26 +2849,33 @@ export function CourseEditorV2Form({
   async function uploadIntroVideo(courseIdToUse: string) {
     if (videoProvider === "html5") {
       if (!videoFile) return;
-      const { data: sign } = await fetchJson<{ bucket_id: string; object_name: string; token: string }>(
-        `/api/v2/courses/${courseIdToUse}/intro-video/sign`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ mime: "video/mp4", size_bytes: videoFile.size }),
-        }
-      );
+      const file = videoFile;
 
-      const uploadRes = await supabase.storage.from(sign.bucket_id).uploadToSignedUrl(sign.object_name, sign.token, videoFile, {
-        contentType: videoFile.type,
+      const uploaded = await uploadFileToSignedUrlWithRetry({
+        file,
+        contentType: file.type || "video/mp4",
+        label: file.name ? `Intro video "${file.name}"` : "Intro video",
+        onProgress: reportUploadProgress,
+        signUpload: async () => {
+          const { data } = await fetchJson<{ bucket_id: string; object_name: string; token: string }>(
+            `/api/v2/courses/${courseIdToUse}/intro-video/sign`,
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ mime: "video/mp4", size_bytes: file.size }),
+            }
+          );
+          if (!data.bucket_id || !data.object_name || !data.token) {
+            throw new Error("Intro video upload could not be signed.");
+          }
+          return data;
+        },
       });
-      if (uploadRes.error) {
-        throw new Error(`Intro video upload failed: ${uploadRes.error.message}`);
-      }
 
       await fetchJson(`/api/v2/courses/${courseIdToUse}/intro-video/commit`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ storage_path: sign.object_name, mime: "video/mp4", size_bytes: videoFile.size }),
+        body: JSON.stringify({ storage_path: uploaded.object_name, mime: "video/mp4", size_bytes: file.size }),
       });
 
       setVideoFile(null);
@@ -2714,6 +2915,7 @@ export function CourseEditorV2Form({
       file,
       contentType: file.type || "image/webp",
       label: "Thumbnail",
+      onProgress: reportUploadProgress,
       signUpload: async () => {
         const { data } = await fetchJson<{ bucket_id: string; object_name: string; token: string }>(
           `/api/v2/courses/${courseIdToUse}/thumbnail/sign`,
@@ -2748,15 +2950,28 @@ export function CourseEditorV2Form({
     setThumbnailFile(null);
   }
 
-  async function runStep<T>(step: string, fn: () => Promise<T>): Promise<T> {
+  async function runStep<T>(step: string, fn: () => Promise<T>, opts?: { timeoutMs?: number }): Promise<T> {
     if (busyActionRef.current) {
       setBusyStep(step);
       setBusyVisitedSteps((prev) => (prev.includes(step) ? prev : [...prev, step]));
     }
+    const timeoutMs = opts?.timeoutMs ?? STEP_TIMEOUT_DEFAULT_MS;
+    let timeoutId: ReturnType<typeof setTimeout> | null = null;
     try {
-      return await fn();
+      if (!timeoutMs || timeoutMs <= 0) {
+        return await fn();
+      }
+      // Backstop ceiling so a step can never spin forever even if an inner await stalls.
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        timeoutId = setTimeout(() => {
+          reject(new Error(`${step} timed out. Please check your connection and try again.`));
+        }, timeoutMs);
+      });
+      return await Promise.race([fn(), timeoutPromise]);
     } catch (e) {
       throw new StepError(step, e);
+    } finally {
+      if (timeoutId) clearTimeout(timeoutId);
     }
   }
 
@@ -2903,7 +3118,7 @@ export function CourseEditorV2Form({
       const id = await runStep("Preparing course", () => ensureCourseDraftExists());
       courseIdForContext = id;
       const aboutFinal = includeFileUploads
-        ? await runStep("Saving About Course content", () => finalizeCourseAboutInlineImages(id))
+        ? await runStep("Saving About Course content", () => finalizeCourseAboutInlineImages(id), { timeoutMs: STEP_TIMEOUT_UPLOAD_MS })
         : Object.keys(pruneQueueByHtml(pendingCourseAboutInlineImages ?? {}, aboutHtml)).length
           ? savedSnapshotRef.current.aboutHtml
           : aboutHtml;
@@ -2913,15 +3128,15 @@ export function CourseEditorV2Form({
         await runStep("Saving members", () => saveMembers(id));
       }
       if (includeFileUploads) {
-        await runStep("Uploading intro video", () => uploadIntroVideo(id));
+        await runStep("Uploading intro video", () => uploadIntroVideo(id), { timeoutMs: STEP_TIMEOUT_UPLOAD_MS });
       }
       if (includeFileUploads && (pendingThumbnailRemoval || thumbnailFile)) {
         await runStep("Updating thumbnail", async () => {
           await removeThumbnailOnServer(id);
           await uploadThumbnail(id);
-        });
+        }, { timeoutMs: STEP_TIMEOUT_UPLOAD_MS });
       }
-      const syncedTopics = await runStep("Saving chapters and lessons", () => syncCurriculumToServer(id, { includeFileUploads }));
+      const syncedTopics = await runStep("Saving chapters and lessons", () => syncCurriculumToServer(id, { includeFileUploads }), { timeoutMs: STEP_TIMEOUT_UPLOAD_MS });
       setTopics(syncedTopics);
       setPendingDeletedItemIds([]);
       setPendingDeletedTopicIds([]);
@@ -3055,6 +3270,7 @@ export function CourseEditorV2Form({
       setBusyAction(null);
       setBusyStep(null);
       setBusyVisitedSteps([]);
+      setUploadProgress(null);
     }
   }
 
@@ -3073,7 +3289,7 @@ export function CourseEditorV2Form({
       const id = await runStep("Preparing course", () => ensureCourseDraftExists());
       courseIdForContext = id;
       const aboutFinal = includeFileUploads
-        ? await runStep("Saving About Course content", () => finalizeCourseAboutInlineImages(id))
+        ? await runStep("Saving About Course content", () => finalizeCourseAboutInlineImages(id), { timeoutMs: STEP_TIMEOUT_UPLOAD_MS })
         : Object.keys(pruneQueueByHtml(pendingCourseAboutInlineImages ?? {}, aboutHtml)).length
           ? savedSnapshotRef.current.aboutHtml
           : aboutHtml;
@@ -3083,15 +3299,15 @@ export function CourseEditorV2Form({
         await runStep("Saving members", () => saveMembers(id));
       }
       if (includeFileUploads) {
-        await runStep("Uploading intro video", () => uploadIntroVideo(id));
+        await runStep("Uploading intro video", () => uploadIntroVideo(id), { timeoutMs: STEP_TIMEOUT_UPLOAD_MS });
       }
       if (includeFileUploads && (pendingThumbnailRemoval || thumbnailFile)) {
         await runStep("Updating thumbnail", async () => {
           await removeThumbnailOnServer(id);
           await uploadThumbnail(id);
-        });
+        }, { timeoutMs: STEP_TIMEOUT_UPLOAD_MS });
       }
-      const syncedTopics = await runStep("Saving chapters and lessons", () => syncCurriculumToServer(id, { includeFileUploads }));
+      const syncedTopics = await runStep("Saving chapters and lessons", () => syncCurriculumToServer(id, { includeFileUploads }), { timeoutMs: STEP_TIMEOUT_UPLOAD_MS });
       setTopics(syncedTopics);
       setPendingDeletedItemIds([]);
       setPendingDeletedTopicIds([]);
@@ -3223,6 +3439,7 @@ export function CourseEditorV2Form({
       setBusyAction(null);
       setBusyStep(null);
       setBusyVisitedSteps([]);
+      setUploadProgress(null);
     }
   }
 
@@ -3238,20 +3455,20 @@ export function CourseEditorV2Form({
     try {
       const id = await runStep("Preparing course", () => ensureCourseDraftExists());
       courseIdForContext = id;
-      const aboutFinal = await runStep("Saving About Course content", () => finalizeCourseAboutInlineImages(id));
+      const aboutFinal = await runStep("Saving About Course content", () => finalizeCourseAboutInlineImages(id), { timeoutMs: STEP_TIMEOUT_UPLOAD_MS });
       const saved = await runStep("Saving course details", () => saveCore(id, { aboutHtmlOverride: aboutFinal }));
       const membersSigBefore = getMembersSignature();
       if (membersSigBefore !== savedMembersSignatureRef.current) {
         await runStep("Saving members", () => saveMembers(id));
       }
-      await runStep("Uploading intro video", () => uploadIntroVideo(id));
+      await runStep("Uploading intro video", () => uploadIntroVideo(id), { timeoutMs: STEP_TIMEOUT_UPLOAD_MS });
       if (pendingThumbnailRemoval || thumbnailFile) {
         await runStep("Updating thumbnail", async () => {
           await removeThumbnailOnServer(id);
           await uploadThumbnail(id);
-        });
+        }, { timeoutMs: STEP_TIMEOUT_UPLOAD_MS });
       }
-      const syncedTopics = await runStep("Saving chapters and lessons", () => syncCurriculumToServer(id));
+      const syncedTopics = await runStep("Saving chapters and lessons", () => syncCurriculumToServer(id), { timeoutMs: STEP_TIMEOUT_UPLOAD_MS });
       setTopics(syncedTopics);
       setPendingDeletedItemIds([]);
       setPendingDeletedTopicIds([]);
@@ -3377,6 +3594,7 @@ export function CourseEditorV2Form({
       setBusyAction(null);
       setBusyStep(null);
       setBusyVisitedSteps([]);
+      setUploadProgress(null);
     }
   }
 
@@ -3429,6 +3647,7 @@ export function CourseEditorV2Form({
       setBusyAction(null);
       setBusyStep(null);
       setBusyVisitedSteps([]);
+      setUploadProgress(null);
     }
   }
 
@@ -5528,6 +5747,19 @@ export function CourseEditorV2Form({
                       <div className="min-w-0">
                         <p className="text-base font-semibold tracking-tight">{title}</p>
                         <p className="mt-1 text-sm text-muted-foreground">{busyStep ?? "Starting…"}</p>
+                        {uploadProgress ? (
+                          <div className="mt-2">
+                            <p className="text-xs text-muted-foreground truncate">
+                              Uploading {uploadProgress.label} — {uploadProgress.pct}%
+                            </p>
+                            <div className="mt-1 h-1.5 w-full rounded-full bg-muted overflow-hidden">
+                              <div
+                                className="h-full bg-linear-to-r from-[#1b8755] to-[#34c98a] transition-all"
+                                style={{ width: `${uploadProgress.pct}%` }}
+                              />
+                            </div>
+                          </div>
+                        ) : null}
                       </div>
                     </div>
 
