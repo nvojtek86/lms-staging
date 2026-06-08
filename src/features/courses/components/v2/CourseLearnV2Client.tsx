@@ -270,6 +270,15 @@ export function CourseLearnV2Client({
     >;
   });
 
+  const completedCount = useMemo(() => {
+    return orderedItems.filter(({ item }) => {
+      if (visitedItemIds.has(item.id)) return true;
+      return item.item_type === "quiz" && Boolean(quizStateByItemId[item.id]?.passed_at);
+    }).length;
+  }, [orderedItems, quizStateByItemId, visitedItemIds]);
+
+  const completionPercent = orderedItems.length > 0 ? Math.round((completedCount / orderedItems.length) * 100) : 0;
+
   type QuizAttempt = {
     id: string;
     attempt_number: number;
@@ -598,8 +607,16 @@ export function CourseLearnV2Client({
                     <div className="mt-1 text-xl font-semibold text-foreground truncate">Get the most out of {courseTitle}</div>
                   </div>
                   <div className="shrink-0">
-                    <div className="h-12 w-12 rounded-full border-4 border-muted flex items-center justify-center text-xs font-semibold text-foreground">
-                      0/{orderedItems.length}
+                    <div
+                      className="h-12 w-12 rounded-full p-1 transition-all"
+                      style={{
+                        background: `conic-gradient(#10b981 ${completionPercent * 3.6}deg, hsl(var(--muted)) 0deg)`,
+                      }}
+                      aria-label={`Course progress ${completedCount} of ${orderedItems.length}`}
+                    >
+                      <div className="h-full w-full rounded-full bg-card flex items-center justify-center text-xs font-semibold text-foreground">
+                        {completedCount}/{orderedItems.length}
+                      </div>
                     </div>
                   </div>
                 </div>
@@ -729,7 +746,7 @@ export function CourseLearnV2Client({
                     <img
                       src={selected.item.lesson.feature_image_url}
                       alt="Lesson feature"
-                      className="w-full max-h-[360px] object-cover rounded-2xl border bg-background"
+                      className="w-full h-auto max-h-[420px] object-contain rounded-2xl border bg-background"
                     />
                   ) : null}
 
@@ -896,7 +913,7 @@ export function CourseLearnV2Client({
                                 const isCorrect = Boolean(r?.correct);
                                 const qType = (q.type ?? "").toString();
                                 const questionTitle = q.title?.trim() || `Question ${idx + 1}`;
-                                const questionTypeLabel = qType.replace(/_/g, " ");
+                                const questionTypeLabel = qType === "true_false" ? "True/False (Tačno/Netačno)" : qType.replace(/_/g, " ");
 
                                 const correctBlock = (() => {
                                   if (!r || r.correct) return null;
@@ -907,7 +924,7 @@ export function CourseLearnV2Client({
                                     return (
                                       <div className="rounded-xl border bg-muted/10 p-4">
                                         <div className="text-sm font-semibold text-foreground">This is the correct answer</div>
-                                        <div className="mt-2 text-sm text-foreground">{ca.value ? "True" : "False"}</div>
+                                        <div className="mt-2 text-sm text-foreground">{ca.value ? "True (Tačno)" : "False (Netačno)"}</div>
                                       </div>
                                     );
                                   }
@@ -1002,7 +1019,7 @@ export function CourseLearnV2Client({
                             {(quiz?.questions ?? []).map((q, idx) => {
                               const qType = (q.type ?? "").toString();
                               const questionTitle = q.title?.trim() || `Question ${idx + 1}`;
-                              const questionTypeLabel = qType.replace(/_/g, " ");
+                              const questionTypeLabel = qType === "true_false" ? "True/False (Tačno/Netačno)" : qType.replace(/_/g, " ");
                               const answer = quizAnswers[q.id];
                               const isRequired = Boolean(q.answer_required);
 
@@ -1043,8 +1060,8 @@ export function CourseLearnV2Client({
                                   {qType === "true_false" ? (
                                     <div className="space-y-2">
                                       {[
-                                        { id: "true", label: "True", value: true },
-                                        { id: "false", label: "False", value: false },
+                                        { id: "true", label: "True (Tačno)", value: true },
+                                        { id: "false", label: "False (Netačno)", value: false },
                                       ].map((opt) => {
                                         const checked = typeof answer === "boolean" ? answer === opt.value : false;
                                         return (

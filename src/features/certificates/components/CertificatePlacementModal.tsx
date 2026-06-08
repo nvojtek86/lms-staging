@@ -261,16 +261,12 @@ export function CertificatePlacementModal({
       const nextX = edgeX !== 0 ? curX + dx / 2 : curX;
       const nextY = edgeY !== 0 ? curY + dy / 2 : curY;
 
-      // Tie font size to the resized box height (simple + effective).
-      const nextFontSize = clampFontSize(nextH * 0.62);
-
       return {
         ...prev,
         xPct: clamp01(nextX / w),
         yPct: clamp01(nextY / h),
         wPct: clamp01(nextW / w),
         hPct: clamp01(nextH / h),
-        fontSize: nextFontSize,
       };
     });
   }
@@ -491,6 +487,21 @@ export function CertificatePlacementModal({
                   <option value="courier_bold">Courier Bold</option>
                   <option value="courier">Courier</option>
                 </select>
+                <label className="block">
+                  <span className="mb-1 block text-xs font-medium text-muted-foreground">Font size (px)</span>
+                  <input
+                    className="w-full rounded-lg border bg-white px-3 py-2 text-sm"
+                    type="number"
+                    min={6}
+                    max={200}
+                    step={1}
+                    value={placement.fontSize ?? 32}
+                    onChange={(e) => {
+                      const next = clampFontSize(Number(e.target.value));
+                      setPlacement((p) => ({ ...p, fontSize: next }));
+                    }}
+                  />
+                </label>
                 <div className="text-xs text-muted-foreground">Uses PDF built-in fonts for maximum compatibility.</div>
               </div>
 

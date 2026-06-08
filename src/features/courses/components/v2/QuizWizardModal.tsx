@@ -264,7 +264,7 @@ function normalizePayload(initial: Record<string, unknown> | null | undefined, f
 }
 
 const QUESTION_TYPE_OPTIONS: Array<{ id: QuizQuestionType; label: string }> = [
-  { id: "true_false", label: "True/False" },
+  { id: "true_false", label: "True/False (Tačno/Netačno)" },
   { id: "single_choice", label: "Single choice" },
   { id: "multiple_choice", label: "Multiple Choice" },
   { id: "fill_in_the_blanks", label: "Fill In The Blanks" },
@@ -686,7 +686,7 @@ function TrueFalseCorrectSelector({
     <div className="rounded-lg border bg-background p-4">
       <div className="text-sm font-medium text-foreground">Correct answer</div>
       <div className="mt-3 flex items-center gap-3">
-        <span className={cn("text-sm", !value ? "text-foreground font-medium" : "text-muted-foreground")}>False</span>
+        <span className={cn("text-sm", !value ? "text-foreground font-medium" : "text-muted-foreground")}>False (Netačno)</span>
         <button
           type="button"
           onClick={() => onChange(!value)}
@@ -699,9 +699,9 @@ function TrueFalseCorrectSelector({
         >
           <span className={cn("h-5 w-5 rounded-full bg-background shadow-sm transition-transform", value ? "translate-x-6" : "translate-x-0")} />
         </button>
-        <span className={cn("text-sm", value ? "text-foreground font-medium" : "text-muted-foreground")}>True</span>
+        <span className={cn("text-sm", value ? "text-foreground font-medium" : "text-muted-foreground")}>True (Tačno)</span>
       </div>
-      <div className="mt-2 text-xs text-muted-foreground">Choose whether the correct answer is True or False.</div>
+      <div className="mt-2 text-xs text-muted-foreground">Choose whether the correct answer is True (Tačno) or False (Netačno).</div>
     </div>
   );
 }

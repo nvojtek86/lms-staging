@@ -110,7 +110,7 @@ export default async function OrgReportsPage({
     fetchEnrollmentSummaryPage({ ...filters, page, pageSize }),
     fetchEnrollmentsDaily({
       organizationId: orgId,
-      days: 14,
+      days: 90,
       from: from || undefined,
       to: to || undefined,
     }),
@@ -128,6 +128,7 @@ export default async function OrgReportsPage({
   const topCourses = topCoursesRes.rows;
   const topUsers = topUsersRes.rows;
   const maxDaily = Math.max(1, ...daily.points.map((p) => p.count));
+  const hasDailyData = daily.points.some((p) => p.count > 0);
 
   const exportParams = new URLSearchParams();
   exportParams.set("orgId", orgId);
@@ -199,22 +200,6 @@ export default async function OrgReportsPage({
         </div>
       ) : null}
 
-      <ReportFiltersClient
-        mode="org"
-        orgIdFixed={orgId}
-        initial={{
-          q,
-          result,
-          from,
-          to,
-          orgId: orgId,
-          courseId,
-          courseLabel,
-          userId,
-          userLabel,
-        }}
-      />
-
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         {cards.map((c) => {
           const Icon = c.icon;
@@ -235,24 +220,48 @@ export default async function OrgReportsPage({
         })}
       </div>
 
+      <ReportFiltersClient
+        mode="org"
+        orgIdFixed={orgId}
+        initial={{
+          q,
+          result,
+          from,
+          to,
+          orgId: orgId,
+          courseId,
+          courseLabel,
+          userId,
+          userLabel,
+        }}
+      />
+
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         <div className="bg-card border rounded-lg p-6 shadow-sm lg:col-span-2">
           <h2 className="text-lg font-semibold text-foreground mb-4">Enrollments (daily)</h2>
-          <div className="flex items-end gap-1 h-40">
-            {daily.points.map((p) => (
-              <div key={p.day} className="flex-1 min-w-0">
-                <div
-                  className="w-full rounded-sm bg-primary/80"
-                  style={{ height: `${Math.round((p.count / maxDaily) * 100)}%` }}
-                  title={`${p.day}: ${p.count}`}
-                />
+          {hasDailyData ? (
+            <>
+              <div className="flex items-end gap-1 h-40">
+                {daily.points.map((p) => (
+                  <div key={p.day} className="flex-1 min-w-0">
+                    <div
+                      className="w-full rounded-sm bg-primary/80"
+                      style={{ height: `${Math.round((p.count / maxDaily) * 100)}%` }}
+                      title={`${p.day}: ${p.count}`}
+                    />
+                  </div>
+                ))}
               </div>
-            ))}
-          </div>
-          <div className="mt-2 flex justify-between text-xs text-muted-foreground">
-            <span>{daily.points[0]?.day ?? ""}</span>
-            <span>{daily.points[daily.points.length - 1]?.day ?? ""}</span>
-          </div>
+              <div className="mt-2 flex justify-between text-xs text-muted-foreground">
+                <span>{daily.points[0]?.day ?? ""}</span>
+                <span>{daily.points[daily.points.length - 1]?.day ?? ""}</span>
+              </div>
+            </>
+          ) : (
+            <div className="flex h-40 items-center justify-center rounded-lg border border-dashed bg-muted/20 px-4 text-center text-sm text-muted-foreground">
+              No enrollments in the selected period.
+            </div>
+          )}
         </div>
 
         <div className="bg-card border rounded-lg p-6 shadow-sm">
